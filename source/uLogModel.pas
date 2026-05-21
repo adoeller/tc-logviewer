@@ -5,7 +5,7 @@ unit uLogModel;
 interface
 
 uses
-  SysUtils, uLogTypes, uLogParser;
+  SysUtils, Math, uLogTypes;
 
 type
   TLogList = class
@@ -13,21 +13,25 @@ type
     FItems    : TLogEntryArray;
     FCount    : Integer;
     FCapacity : Integer;
+    FRawBuf   : AnsiString;   // gesamter Rohtext aller Zeilen in einem Puffer
+    FRawUsed  : Integer;      // genutzte Bytes in FRawBuf
     function GetItem(Index: Integer): TLogEntry;
-    procedure SetItem(Index: Integer; const Value: TLogEntry);
     procedure Grow;
   public
     constructor Create;
-    procedure Add(const AEntry: TLogEntry);
-    function  PrepareAdd: Integer;    // ensures capacity, returns index
-    procedure CommitAdd; inline;      // increments count
+    procedure ReserveRaw(AFileSize: Int64);
+    function  AppendRaw(ABuf: PAnsiChar; ALen: Integer): Integer;
+    function  RawPtr(AOffset: Integer): PAnsiChar; inline;
+    function  RawStr(AOffset, ALen: Integer): string; inline;
+    function  PrepareAdd: Integer;
+    procedure CommitAdd; inline;
     function  Slot(AIndex: Integer): PLogEntry; inline;
     procedure Clear;
-    procedure TrimToSize;
     procedure EnsureCapacity(ACount: Integer);
-    property Count    : Integer read FCount;
-    property Items[Index: Integer]: TLogEntry read GetItem write SetItem; default;
+    property Count    : Integer       read FCount;
+    property Items[Index: Integer]: TLogEntry read GetItem; default;
     property RawItems : TLogEntryArray read FItems;
+    property RawBufUsed : Integer     read FRawUsed;
   end;
 
 implementation
@@ -41,6 +45,37 @@ begin
   FCount    := 0;
   FCapacity := INITIAL_CAPACITY;
   SetLength(FItems, FCapacity);
+  FRawBuf  := '';
+  FRawUsed := 0;
+end;
+
+procedure TLogList.ReserveRaw(AFileSize: Int64);
+begin
+  // Puffer wiederverwenden wenn gross genug, sonst wachsen
+  if AFileSize + 1 > Length(FRawBuf) then
+    SetLength(FRawBuf, AFileSize + 1);
+  FRawUsed := 0;
+end;
+
+function TLogList.AppendRaw(ABuf: PAnsiChar; ALen: Integer): Integer;
+begin
+  // Puffer bei Tail-Eintraegen ggf. vergroessern
+  if FRawUsed + ALen + 1 > Length(FRawBuf) then
+    SetLength(FRawBuf, Max(Length(FRawBuf) * 2, FRawUsed + ALen + 65536));
+  Result := FRawUsed;
+  if ALen > 0 then
+    Move(ABuf^, FRawBuf[FRawUsed + 1], ALen);
+  Inc(FRawUsed, ALen);
+end;
+
+function TLogList.RawPtr(AOffset: Integer): PAnsiChar;
+begin
+  Result := PAnsiChar(@FRawBuf[AOffset + 1]);
+end;
+
+function TLogList.RawStr(AOffset, ALen: Integer): string;
+begin
+  SetString(Result, PAnsiChar(@FRawBuf[AOffset + 1]), ALen);
 end;
 
 procedure TLogList.Grow;
@@ -52,20 +87,13 @@ begin
   SetLength(FItems, FCapacity);
 end;
 
-procedure TLogList.Add(const AEntry: TLogEntry);
-begin
-  if FCount >= FCapacity then Grow;
-  FItems[FCount] := AEntry;
-  Inc(FCount);
-end;
-
 function TLogList.PrepareAdd: Integer;
 begin
   if FCount >= FCapacity then Grow;
   Result := FCount;
 end;
 
-procedure TLogList.CommitAdd;
+procedure TLogList.CommitAdd; inline;
 begin
   Inc(FCount);
 end;
@@ -75,17 +103,14 @@ begin
   Result := @FItems[AIndex];
 end;
 
+{ Clear: O(1) da TLogEntry keine Managed-Felder hat.
+  FRawBuf bleibt allokiert fuer Wiederverwendung bei naechster Datei. }
 procedure TLogList.Clear;
 begin
   FCount    := 0;
   FCapacity := INITIAL_CAPACITY;
-  SetLength(FItems, FCapacity);
-end;
-
-procedure TLogList.TrimToSize;
-begin
-  SetLength(FItems, FCount);
-  FCapacity := FCount;
+  SetLength(FItems, FCapacity);   // kein Finalizer-Loop – unmanaged Record
+  FRawUsed  := 0;                 // Puffer-Inhalt einfach vergessen
 end;
 
 procedure TLogList.EnsureCapacity(ACount: Integer);
@@ -100,11 +125,6 @@ end;
 function TLogList.GetItem(Index: Integer): TLogEntry;
 begin
   Result := FItems[Index];
-end;
-
-procedure TLogList.SetItem(Index: Integer; const Value: TLogEntry);
-begin
-  FItems[Index] := Value;
 end;
 
 end.

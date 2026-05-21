@@ -6,12 +6,25 @@ interface
 
 uses
   Classes, SysUtils, Forms, Controls, Graphics, Dialogs,
-  Menus, StdCtrls, ComCtrls, ExtCtrls, Buttons, LCLType, Clipbrd, Spin, Math,
+  Menus, StdCtrls, ComCtrls, ExtCtrls, Buttons, LCLIntf, LCLType,
+  Clipbrd, Spin, Math,
   DateTimePicker,
   uLogTypes, uLogModel, uLogParser, uLogFilter,
   uSettings, uFormats, uTailWatcher, uOptionsDlg;
 
 type
+
+  { TVirtualListBox – LBS_NODATA erlaubt LB_SETCOUNT (O(1) statt 1M LB_ADDSTRING) }
+  TVirtualListBox = class(TListBox)
+  private
+    FNoData : Boolean;   // True wenn LBS_NODATA erfolgreich gesetzt wurde
+  protected
+    procedure CreateParams(var Params: TCreateParams); override;
+  public
+    procedure SetVirtualCount(ACount: Integer);   // bulk: loescht + setzt
+    procedure AppendVirtualItem;                  // tail: haengt einzeln an, kein Reset
+  end;
+
   TfrmMain = class(TForm)
   private
     MainMenu1     : TMainMenu;
@@ -37,8 +50,11 @@ type
     btnClearSearch : TSpeedButton;
     lblQuickSearch : TLabel;
     FFollowTail    : Boolean;
-    lbLog         : TListBox;
+    lbLog         : TVirtualListBox;
     sbStatus      : TStatusBar;
+    sbpMain       : TStatusPanel;   // Dateiname + Zeilen
+    sbpEWI        : TStatusPanel;   // E/W/I Counts (fett je nach neuestem)
+    FLastStatTime : TDateTime;      // Zeitpunkt des zuletzt geaenderten Zählers
     OpenDialog    : TOpenDialog;
     PopupMenu1    : TPopupMenu;
     mniPopCopy    : TMenuItem;
@@ -60,7 +76,11 @@ type
     FDetectedFmt  : TLogFormat;
     FCurrentFmt   : TLogFormat;
     FSearchText   : string;
-    FSepLineX     : Integer;   // gecachte X-Position der Trennlinie (-1 = neu berechnen)
+    FSepLineX     : Integer;
+    FMaxLineWidth : Integer;
+    FCachedCharW  : Integer;   // Pixel-Breite eines Zeichens (gecacht aus DrawItem)
+    FResizeTimer  : TTimer;
+    FFilterTimer  : TTimer;   // 100ms Debounce fuer QuickSearch   // gecachte X-Position der Trennlinie (-1 = neu berechnen)
 
     procedure BuildUI;
     procedure ResetStats;
@@ -114,11 +134,19 @@ type
     procedure DoClearSearch(Sender: TObject);
     procedure lbLogDrawItem(Control: TWinControl; Index: Integer;
       ARect: TRect; State: TOwnerDrawState);
+    procedure lbLogMeasureItem(Control: TWinControl; Index: Integer;
+      var AHeight: Integer);
     procedure FormClose(Sender: TObject; var CloseAction: TCloseAction);
     procedure FormResizeHandler(Sender: TObject);
+    procedure ResizeTimerFired(Sender: TObject);
+    procedure FilterTimerFired(Sender: TObject);
+    procedure sbStatusDrawPanel(StatusBar: TStatusBar; Panel: TStatusPanel;
+      const Rect: TRect);
+    procedure sbStatusResize(Sender: TObject);
     procedure PositionQuickSearch;
     procedure DisableFollowTemp;
     procedure ScrollToEndCurrent;
+    procedure UpdateHorzScrollbar;
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
@@ -128,6 +156,69 @@ var
   frmMain: TfrmMain;
 
 implementation
+
+const
+  READ_BUF_SIZE = 131072;   // 128 KB I/O-Puffer
+
+{ TVirtualListBox }
+
+procedure TVirtualListBox.CreateParams(var Params: TCreateParams);
+const
+  LBS_HASSTRINGS = $0040;
+  LBS_NODATA     = $2000;
+begin
+  inherited CreateParams(Params);
+  // LBS_NODATA: Listbox speichert keine Strings → LB_SETCOUNT wird unterstuetzt
+  Params.Style := (Params.Style and (not LBS_HASSTRINGS)) or LBS_NODATA;
+end;
+
+procedure TVirtualListBox.SetVirtualCount(ACount: Integer);
+const
+  LB_RESETCONTENT = $0184;
+  LB_SETCOUNT     = $01A7;
+  LB_GETCOUNT     = $018B;
+var
+  SL : TStringList;
+  i  : Integer;
+begin
+  {$IFDEF WINDOWS}
+  SendMessage(Handle, LB_RESETCONTENT, 0, 0);
+  SendMessage(Handle, LB_SETCOUNT, LongWord(ACount), 0);
+  FNoData := SendMessage(Handle, LB_GETCOUNT, 0, 0) = ACount;
+  if FNoData then Exit;
+  {$ENDIF}
+  // Fallback: LBS_NODATA nicht aktiv
+  SL := TStringList.Create;
+  try
+    SL.Capacity := ACount;
+    for i := 0 to ACount - 1 do SL.Add('');
+    Items.BeginUpdate;
+    try
+      Items.Assign(SL);
+    finally
+      Items.EndUpdate;
+    end;
+  finally
+    SL.Free;
+  end;
+end;
+
+procedure TVirtualListBox.AppendVirtualItem;
+const
+  LB_SETCOUNT = $01A7;
+  LB_GETCOUNT = $018B;
+begin
+  {$IFDEF WINDOWS}
+  if FNoData then
+  begin
+    // Zaehler ohne Reset erhoehen — kein Flimmern, kein Loeschen
+    SendMessage(Handle, LB_SETCOUNT,
+      SendMessage(Handle, LB_GETCOUNT, 0, 0) + 1, 0);
+    Exit;
+  end;
+  {$ENDIF}
+  Items.Add('');
+end;
 
 procedure TfrmMain.DisableFollowTemp;
 begin
@@ -177,23 +268,22 @@ function TfrmMain.FormatLogLine(AIndex: Integer): string;
 var
   NumStr : string;
   Pad    : Integer;
+  RawS   : string;
 begin
-  if (AIndex < 0) or (AIndex > FFilteredCount - 1) then
-  begin
-    Result := '';
-    Exit;
-  end;
+  if (AIndex < 0) or (AIndex >= FFilteredCount) then
+  begin Result := ''; Exit; end;
+  RawS := FLog.RawStr(FFiltered[AIndex].RawOffset, FFiltered[AIndex].RawLen);
   if AppSettings.ShowLineNumbers then
   begin
     NumStr := IntToStr(FFiltered[AIndex].LineNo);
     Pad := AppSettings.LineNumberWidth - Length(NumStr);
     if Pad > 0 then
-      Result := StringOfChar(' ', Pad) + NumStr + '  ' + FFiltered[AIndex].Raw
+      Result := StringOfChar(' ', Pad) + NumStr + '  ' + RawS
     else
-      Result := NumStr + '  ' + FFiltered[AIndex].Raw;
+      Result := NumStr + '  ' + RawS;
   end
   else
-    Result := FFiltered[AIndex].Raw;
+    Result := RawS;
 end;
 
 constructor TfrmMain.Create(AOwner: TComponent);
@@ -201,7 +291,7 @@ begin
   inherited Create(AOwner);
   LoadSettings;
   FLog          := TLogList.Create;
-  FFilter       := TFilterSpec.Create;
+  FFilter       := TFilterSpec.Create(FLog);
   FTail         := TTailWatcher.Create;
   FTail.OnNewLine := @OnTailNewLine;
   FFileName     := '';
@@ -214,6 +304,17 @@ begin
   FFollowTail   := True;
   FSearchText   := '';
   FSepLineX     := -1;
+  FLastStatTime := 0;
+  FMaxLineWidth := 0;
+  FCachedCharW  := 0;
+  FResizeTimer          := TTimer.Create(Self);
+  FResizeTimer.Interval := 500;
+  FResizeTimer.Enabled  := False;
+  FResizeTimer.OnTimer  := @ResizeTimerFired;
+  FFilterTimer          := TTimer.Create(Self);
+  FFilterTimer.Interval := 100;
+  FFilterTimer.Enabled  := False;
+  FFilterTimer.OnTimer  := @FilterTimerFired;
   BuildUI;
   ApplyAppSettings;
   if ParamCount > 0 then
@@ -242,6 +343,8 @@ begin
 end;
 
 procedure TfrmMain.BuildUI;
+var
+  i : Integer;
 
   function AddMnu(AParent: TMenuItem; const ACaption: string;
     AEvent: TNotifyEvent; AShortcut: TShortCut = 0): TMenuItem;
@@ -279,6 +382,7 @@ begin
   Left     := AppSettings.WinLeft;
   Top      := AppSettings.WinTop;
   if AppSettings.WinMaximized then WindowState := wsMaximized;
+  ShowHint := True;
   OnClose  := @FormClose;
   OnResize := @FormResizeHandler;
 
@@ -346,6 +450,22 @@ begin
   MakeBtn('W>',     @DoNextWarn, 225,  30);
   MakeBtn('<I',     @DoPrevInfo, 259,  30);
   MakeBtn('I>',     @DoNextInfo, 292,  30);
+
+  // Tooltips auf den Buttons setzen (Controls sind direkte Kinder von pnlToolbar)
+  with pnlToolbar do
+  begin
+    TButton(Controls[0]).Hint := 'Open log file  (Ctrl+O)';
+    TButton(Controls[1]).Hint := 'Find text in log  (Ctrl+F)';
+    TButton(Controls[2]).Hint := 'Previous ERROR  (Shift+F5)';
+    TButton(Controls[3]).Hint := 'Next ERROR  (F5)';
+    TButton(Controls[4]).Hint := 'Previous WARN';
+    TButton(Controls[5]).Hint := 'Next WARN';
+    TButton(Controls[6]).Hint := 'Previous INFO';
+    TButton(Controls[7]).Hint := 'Next INFO';
+    for i := 0 to 7 do
+      TButton(Controls[i]).ShowHint := True;
+  end;
+
   chkTailBtn            := TCheckBox.Create(Self);
   chkTailBtn.Parent     := pnlToolbar;
   chkTailBtn.Caption    := 'Tail';
@@ -353,6 +473,8 @@ begin
   chkTailBtn.Width      := 55;
   chkTailBtn.Checked    := AppSettings.TailEnabled;
   chkTailBtn.OnClick    := @DoTailToggle;
+  chkTailBtn.Hint       := 'Watch file for new lines  (F6)';
+  chkTailBtn.ShowHint   := True;
 
   chkFollowBtn          := TCheckBox.Create(Self);
   chkFollowBtn.Parent   := pnlToolbar;
@@ -361,8 +483,12 @@ begin
   chkFollowBtn.Width    := 65;
   chkFollowBtn.Checked  := True;
   chkFollowBtn.OnClick  := @DoFollowTailToggle;
+  chkFollowBtn.Hint     := 'Auto-scroll to newest line during tail';
+  chkFollowBtn.ShowHint := True;
 
   MakeBtn('Options', @DoOptionen, 465, 70);
+  TButton(pnlToolbar.Controls[pnlToolbar.ControlCount - 1]).Hint     := 'Open settings dialog';
+  TButton(pnlToolbar.Controls[pnlToolbar.ControlCount - 1]).ShowHint := True;
 
   lblQuickSearch          := TLabel.Create(Self);
   lblQuickSearch.Parent   := pnlToolbar;
@@ -377,6 +503,8 @@ begin
   edtQuickSearch.Height   := 22;
   edtQuickSearch.Anchors  := [akRight, akTop];
   edtQuickSearch.OnChange := @DoQuickSearch;
+  edtQuickSearch.Hint     := 'Filter visible lines by text  (Ctrl+L)';
+  edtQuickSearch.ShowHint := True;
 
   btnClearSearch         := TSpeedButton.Create(Self);
   btnClearSearch.Parent  := pnlToolbar;
@@ -387,15 +515,18 @@ begin
   btnClearSearch.Flat    := True;
   btnClearSearch.Anchors := [akRight, akTop];
   btnClearSearch.OnClick := @DoClearSearch;
+  btnClearSearch.Hint    := 'Clear filter  (Ctrl+Shift+F)';
+  btnClearSearch.ShowHint := True;
 
-  lbLog                := TListBox.Create(Self);
+  lbLog                := TVirtualListBox.Create(Self);
   lbLog.Parent         := Self;
   lbLog.Align          := alClient;
-  lbLog.Style          := lbOwnerDrawFixed;
-  lbLog.ItemHeight     := 16;
-  lbLog.MultiSelect    := True;
-  lbLog.ExtendedSelect := True;
-  lbLog.OnDrawItem     := @lbLogDrawItem;
+  lbLog.Style           := lbOwnerDrawVariable;
+  lbLog.ItemHeight      := 16;   // Minimum / Fallback
+  lbLog.MultiSelect     := True;
+  lbLog.ExtendedSelect  := True;
+  lbLog.OnDrawItem      := @lbLogDrawItem;
+  lbLog.OnMeasureItem   := @lbLogMeasureItem;
 
   PopupMenu1        := TPopupMenu.Create(Self);
   mniPopCopy        := TMenuItem.Create(PopupMenu1);
@@ -411,8 +542,20 @@ begin
   sbStatus             := TStatusBar.Create(Self);
   sbStatus.Parent      := Self;
   sbStatus.Align       := alBottom;
-  sbStatus.SimplePanel := True;
-  sbStatus.SimpleText  := 'Ready';
+  sbStatus.SimplePanel := False;
+  sbStatus.Hint        := 'Logfile and last Error/Warn/Info';
+  sbStatus.ShowHint    := True;
+
+  sbpMain          := sbStatus.Panels.Add;
+  sbpMain.Width    := 600;
+  sbpMain.Style    := psText;
+  sbpMain.Text     := 'Ready';
+
+  sbpEWI           := sbStatus.Panels.Add;
+  sbpEWI.Width     := 310;
+  sbpEWI.Style     := psOwnerDraw;
+  sbStatus.OnDrawPanel := @sbStatusDrawPanel;
+  sbStatus.OnResize    := @sbStatusResize;
 
   OpenDialog         := TOpenDialog.Create(Self);
   OpenDialog.Filter  := 'Log Files|*.log;*.txt;*.csv;*.json|JSON|*.json|All Files|*.*';
@@ -457,6 +600,7 @@ begin
   // StatusBar
   sbStatus.Color      := AppSettings.BgStatus;
   sbStatus.Font.Color := AppSettings.FgStatus;
+  sbStatus.Invalidate;
 end;
 
 procedure TfrmMain.ApplyAppSettings;
@@ -466,13 +610,15 @@ begin
   lbLog.Font.Size     := AppSettings.FontSize;
   mniLineNr.Checked   := AppSettings.ShowLineNumbers;
   mniWordWrap.Checked := AppSettings.WordWrap;
-  FSepLineX := -1;    // Trennlinien-Position neu berechnen lassen
+  FSepLineX    := -1;   // Trennlinien-Position neu berechnen lassen
+  FCachedCharW := 0;    // Zeichenbreite neu berechnen lassen
   ApplyThemeToUI;
-  lbLog.Invalidate;
-end;
-
-
-function TfrmMain.GetFileSizeByName(const AFilename: string): Int64;
+  // Hoehen-Cache der ListBox zuruecksetzen: Style kurz toggeln
+  // erzwingt erneutes OnMeasureItem fuer alle Items
+  lbLog.Style := lbOwnerDrawFixed;
+  lbLog.Style := lbOwnerDrawVariable;
+  UpdateHorzScrollbar;
+end;function TfrmMain.GetFileSizeByName(const AFilename: string): Int64;
 var SR: TSearchRec;
 begin
   Result := 0;
@@ -508,57 +654,161 @@ begin
 end;
 
 procedure TfrmMain.LoadFile(const AFilename: string);
+const
+  DETECT_LINES  = 50;
 var
-  SL    : TStringList;
-  FS    : TFileStream;
-  Lines : TStringArray;
-  i, idx: Integer;
+  FS         : TFileStream;
+  RawBuf     : array[0..READ_BUF_SIZE - 1] of Byte;
+  BytesRead  : Integer;
+  P          : Integer;
+  LineNo     : Integer;
+  Line       : string;
+  Carry      : AnsiString;   // Bytes der unvollst. letzten Zeile eines Blocks
+  CarryLen   : Integer;
+  Lines      : TStringArray;
+  FileSize   : Int64;
+  EstLines   : Integer;
+  idx        : Integer;
+  DetectDone : Boolean;
+  LineStart  : Integer;
+  LineEnd    : Integer;
+
+  procedure EmitLine(ABuf: PAnsiChar; ALen: Integer); inline;
+  var
+    RawOff : Integer;
+  begin
+    if (ALen > 0) and (ABuf[ALen - 1] = #13) then Dec(ALen);
+    Inc(LineNo);
+
+    // Rohzeile einmalig in zentralen Puffer schreiben – kein String-Objekt
+    RawOff := FLog.AppendRaw(ABuf, ALen);
+
+    // Erste DETECT_LINES als String fuer Format-Erkennung (kurzlebig)
+    if (not DetectDone) and (LineNo <= DETECT_LINES) then
+    begin
+      SetString(Line, ABuf, ALen);
+      Lines[LineNo - 1] := Line;
+    end;
+
+    if (not DetectDone) and (LineNo = DETECT_LINES) then
+    begin
+      if AppSettings.AutoDetectFormat then
+        FDetectedFmt := TLogParser.DetectFormat(Lines)
+      else
+        FDetectedFmt := AppSettings.ForceFormat;
+      FCurrentFmt := FDetectedFmt;
+      DetectDone  := True;
+      SetLength(Lines, 0);
+      Line := '';
+    end;
+
+    idx := FLog.PrepareAdd;
+    // Fuer den Parser einen kurzlebigen String erzeugen (wird direkt freigegeben)
+    if DetectDone and (Line = '') then
+      SetString(Line, ABuf, ALen);
+    TLogParser.ParseLine(Line, LineNo, FCurrentFmt, FLog.Slot(idx)^);
+    // Offset und Laenge vom Puffer setzen (ParseLine setzt diese Felder nicht mehr)
+    FLog.Slot(idx)^.RawOffset := RawOff;
+    FLog.Slot(idx)^.RawLen    := ALen;
+    FLog.CommitAdd;
+    Line := '';
+  end;
+
 begin
   FTail.Stop;
   mniTailToggle.Checked := False;
-  FFileName := AFilename;
-  FFileSize := 0;
-  FFiltered := nil;        // alte Eintraege sofort freigeben
-  FFilteredCount := 0;
+  FFileName     := AFilename;
+  FFileSize     := 0;
+  FFiltered     := nil;
+  FFilteredCount:= 0;
   FFilteredDirect := False;
-  lbLog.Items.Clear;       // alte ListBox-Eintraege freigeben
+  lbLog.Items.Clear;
   FLog.Clear;
   FFilter.Reset;
   edtQuickSearch.Text := '';
-  Lines := nil;
 
-  SL := TStringList.Create;
   try
-    // fmShareDenyNone: Datei lesen auch wenn sie von anderem Prozess gelockt ist
     FS := TFileStream.Create(AFilename, fmOpenRead or fmShareDenyNone);
-    try
-      SL.LoadFromStream(FS);
-    finally
-      FS.Free;
-    end;
+  except
+    Exit;
+  end;
+  try
+    FileSize := FS.Size;
+    EstLines := FileSize div 80 + 1024;
+    FLog.EnsureCapacity(EstLines + EstLines div 10 + 256);
+    FLog.ReserveRaw(FileSize);
+    FFilter.LogList := FLog;
 
-    // Format erkennen: nur erste 50 Zeilen als Sample-Array
-    if AppSettings.AutoDetectFormat then
+    SetLength(Lines, DETECT_LINES);
+    LineNo     := 0;
+    DetectDone := False;
+    Carry      := '';
+    CarryLen   := 0;
+    RawBuf[0]  := 0;   // suppress uninitialized hint; FS.Read fills buffer before use
+    // Format-Default falls Datei < 50 Zeilen
+    if not AppSettings.AutoDetectFormat then
     begin
-      SetLength(Lines, Min(50, SL.Count));
-      for i := 0 to High(Lines) do Lines[i] := SL[i];
-      FDetectedFmt := TLogParser.DetectFormat(Lines);
-      SetLength(Lines, 0);  // Sofort freigeben
-    end
-    else
       FDetectedFmt := AppSettings.ForceFormat;
-    FCurrentFmt := FDetectedFmt;
-
-    // Parsen: direkt in FLog-Slots schreiben, keine Record-Kopie
-    FLog.EnsureCapacity(SL.Count + SL.Count div 10 + 256);
-    for i := 0 to SL.Count - 1 do
-    begin
-      idx := FLog.PrepareAdd;
-      TLogParser.ParseLine(SL[i], i + 1, FCurrentFmt, FLog.Slot(idx)^);
-      FLog.CommitAdd;
+      FCurrentFmt  := FDetectedFmt;
+      DetectDone   := True;
+      SetLength(Lines, 0);
     end;
+
+    repeat
+      BytesRead := FS.Read(RawBuf[0], READ_BUF_SIZE);
+      if BytesRead = 0 then Break;
+
+      LineStart := 0;
+      for P := 0 to BytesRead - 1 do
+      begin
+        if RawBuf[P] = 10 then  // LF gefunden
+        begin
+          LineEnd := P;         // exklusiv (ohne LF)
+          if CarryLen > 0 then
+          begin
+            // Carry + neues Segment zusammenfuehren
+            SetLength(Carry, CarryLen + (LineEnd - LineStart));
+            if LineEnd > LineStart then
+              Move(RawBuf[LineStart], Carry[CarryLen + 1], LineEnd - LineStart);
+            EmitLine(PAnsiChar(Carry), CarryLen + (LineEnd - LineStart));
+            Carry    := '';
+            CarryLen := 0;
+          end
+          else
+            EmitLine(@PAnsiChar(@RawBuf[0])[LineStart], LineEnd - LineStart);
+          LineStart := P + 1;
+        end;
+      end;
+
+      // Rest-Bytes ohne LF in Carry aufnehmen
+      if LineStart < BytesRead then
+      begin
+        SetLength(Carry, CarryLen + (BytesRead - LineStart));
+        Move(RawBuf[LineStart], Carry[CarryLen + 1], BytesRead - LineStart);
+        CarryLen := CarryLen + (BytesRead - LineStart);
+      end;
+    until BytesRead < READ_BUF_SIZE;
+
+    // Letzte Zeile ohne LF am Dateiende
+    if CarryLen > 0 then
+      EmitLine(PAnsiChar(Carry), CarryLen);
+
+    // Format erkennen falls Datei weniger als 50 Zeilen hatte
+    if not DetectDone then
+    begin
+      if AppSettings.AutoDetectFormat then
+      begin
+        SetLength(Lines, Min(LineNo, DETECT_LINES));
+        FDetectedFmt := TLogParser.DetectFormat(Lines);
+        SetLength(Lines, 0);
+      end
+      else
+        FDetectedFmt := AppSettings.ForceFormat;
+      FCurrentFmt := FDetectedFmt;
+    end;
+
   finally
-    SL.Free;
+    FS.Free;
   end;
 
   FFileSize := GetFileSizeByName(AFilename);
@@ -585,47 +835,106 @@ begin
   end;
 end;
 
-function FmtTS(DT: TDateTime): string;
-begin
-  if DT > 0 then
-    Result := FormatDateTime('hh:nn:ss', DT)
-  else
-    Result := '-';
-end;
-
 procedure TfrmMain.UpdateStatus;
 var
-  sLines, sCounts              : string;
-  sErrTime, sWrnTime, sInfTime : string;
+  sLines : string;
 begin
-  sErrTime := FmtTS(FLastETime);
-  sWrnTime := FmtTS(FLastWTime);
-  sInfTime := FmtTS(FLastITime);
-
   if FFilteredCount = FLog.Count then
     sLines := Format('Lines: %d', [FLog.Count])
   else
     sLines := Format('Lines: %d  |  Visible: %d', [FLog.Count, FFilteredCount]);
 
-  sCounts := Format('E: %d (%s)  W: %d (%s)  I: %d (%s)',
-    [FECount, sErrTime, FWCount, sWrnTime, FICount, sInfTime]);
-
-  sbStatus.SimpleText := Format('%s  |  %s  |  %s Byte  |  Format: %s  |  %s',
+  sbpMain.Text := Format('%s  |  %s  |  %s Byte  |  Format: %s',
     [ExtractFileName(FFileName), sLines,
      FormatFloat('#,##0', FFileSize),
-     LogFormatNames[FCurrentFmt], sCounts]);
+     LogFormatNames[FCurrentFmt]]);
+
+  // Neuesten Timestamp der drei Zähler ermitteln
+  FLastStatTime := 0;
+  if FLastETime > FLastStatTime then FLastStatTime := FLastETime;
+  if FLastWTime > FLastStatTime then FLastStatTime := FLastWTime;
+  if FLastITime > FLastStatTime then FLastStatTime := FLastITime;
+
+  sbStatus.Invalidate;   // triggers sbStatusDrawPanel
+end;
+
+procedure TfrmMain.sbStatusResize(Sender: TObject);
+begin
+  // sbpMain nimmt den ganzen Rest links, sbpEWI bleibt fix rechts
+  if sbStatus.ClientWidth > sbpEWI.Width + 40 then
+    sbpMain.Width := sbStatus.ClientWidth - sbpEWI.Width
+  else
+    sbpMain.Width := 40;
+end;
+
+procedure TfrmMain.sbStatusDrawPanel(StatusBar: TStatusBar;
+  Panel: TStatusPanel; const Rect: TRect);
+var
+  Cvs        : TCanvas;
+  sE, sW, sI : string;
+  TotalW, X, Y : Integer;
+
+  function PartWidth(const S: string; Bold: Boolean): Integer;
+  begin
+    if Bold then Cvs.Font.Style := [fsBold] else Cvs.Font.Style := [];
+    Result := Cvs.TextWidth(S);
+  end;
+
+begin
+  if Panel <> sbpEWI then Exit;
+  Cvs := StatusBar.Canvas;
+  Cvs.Brush.Color := StatusBar.Color;
+  Cvs.FillRect(Rect);
+  Cvs.Font.Assign(StatusBar.Font);
+
+  if FLastETime > 0 then sE := Format('E: %d (%s)', [FECount, FormatDateTime('hh:nn:ss', FLastETime)])
+  else                     sE := Format('E: %d (-)',  [FECount]);
+  if FLastWTime > 0 then sW := Format('W: %d (%s)', [FWCount, FormatDateTime('hh:nn:ss', FLastWTime)])
+  else                     sW := Format('W: %d (-)',  [FWCount]);
+  if FLastITime > 0 then sI := Format('I: %d (%s)', [FICount, FormatDateTime('hh:nn:ss', FLastITime)])
+  else                     sI := Format('I: %d (-)',  [FICount]);
+
+  // Gesamtbreite messen für rechtsbündige Startposition
+  TotalW :=
+    PartWidth(sE, (FLastStatTime > 0) and (FLastETime = FLastStatTime)) +
+    PartWidth('  ', False) +
+    PartWidth(sW, (FLastStatTime > 0) and (FLastWTime = FLastStatTime)) +
+    PartWidth('  ', False) +
+    PartWidth(sI, (FLastStatTime > 0) and (FLastITime = FLastStatTime));
+
+  X := Rect.Right - TotalW - 4;
+  if X < Rect.Left + 2 then X := Rect.Left + 2;
+  Y := Rect.Top + (Rect.Bottom - Rect.Top - Cvs.TextHeight('A')) div 2;
+
+  if (FLastStatTime > 0) and (FLastETime = FLastStatTime) then
+    Cvs.Font.Style := [fsBold] else Cvs.Font.Style := [];
+  Cvs.TextOut(X, Y, sE); X := Cvs.PenPos.X;
+
+  Cvs.Font.Style := [];
+  Cvs.TextOut(X, Y, '  '); X := Cvs.PenPos.X;
+
+  if (FLastStatTime > 0) and (FLastWTime = FLastStatTime) then
+    Cvs.Font.Style := [fsBold] else Cvs.Font.Style := [];
+  Cvs.TextOut(X, Y, sW); X := Cvs.PenPos.X;
+
+  Cvs.Font.Style := [];
+  Cvs.TextOut(X, Y, '  '); X := Cvs.PenPos.X;
+
+  if (FLastStatTime > 0) and (FLastITime = FLastStatTime) then
+    Cvs.Font.Style := [fsBold] else Cvs.Font.Style := [];
+  Cvs.TextOut(X, Y, sI);
 end;
 
 procedure TfrmMain.ApplyFilterAndRefresh;
 var
   i  : Integer;
-  SL : TStringList;
 begin
   FFiltered := FFilter.Apply(FLog, FFilteredCount);
   FFilteredDirect := not FFilter.IsActive;
 
   FECount := 0; FWCount := 0; FICount := 0;
   FLastETime := 0; FLastWTime := 0; FLastITime := 0;
+  FMaxLineWidth := 0;
 
   for i := 0 to FFilteredCount - 1 do
   begin
@@ -643,19 +952,24 @@ begin
         if FFiltered[i].TimeStamp > FLastITime then FLastITime := FFiltered[i].TimeStamp;
       end;
     end;
+    // Maximale Zeilenbreite per Zeichenanzahl schätzen (kein GDI nötig)
+    if FFiltered[i].RawLen > FMaxLineWidth then
+      FMaxLineWidth := FFiltered[i].RawLen;
   end;
 
-  // Detached StringList befuellen (kein UI-Overhead), dann einmal zuweisen
-  SL := TStringList.Create;
-  try
-    SL.Capacity := FFilteredCount;
-    for i := 0 to FFilteredCount - 1 do
-      SL.Add('');
-    lbLog.Items.Assign(SL);
-  finally
-    SL.Free;
-  end;
+  // Zeichenanzahl → Pixel mit gecachter Breite (sonst 0 ausserhalb Paint)
+  if FCachedCharW > 0 then
+    FMaxLineWidth := FMaxLineWidth * FCachedCharW
+  else
+    FMaxLineWidth := FMaxLineWidth * lbLog.Canvas.TextWidth('0');
+  if FMaxLineWidth <= 0 then FMaxLineWidth := 0;
+  if AppSettings.ShowLineNumbers then
+    Inc(FMaxLineWidth, FSepLineX + 4);
 
+  // Eine einzige Win32-Nachricht statt 1M × LB_ADDSTRING
+  lbLog.SetVirtualCount(FFilteredCount);
+
+  UpdateHorzScrollbar;
   FFileSize := GetFileSizeByName(FFileName);
   UpdateStatus;
 end;
@@ -668,7 +982,7 @@ var
 begin
   if AppSettings.ColorRuleCount > 0 then
   begin
-    Raw := FFiltered[AIndex].Raw;
+    Raw := FLog.RawStr(FFiltered[AIndex].RawOffset, FFiltered[AIndex].RawLen);
     for i := 0 to AppSettings.ColorRuleCount - 1 do
       if AppSettings.ColorRules[i].Enabled
          and (AppSettings.ColorRules[i].Pattern <> '')
@@ -692,7 +1006,7 @@ var
 begin
   if AppSettings.ColorRuleCount > 0 then
   begin
-    Raw := FFiltered[AIndex].Raw;
+    Raw := FLog.RawStr(FFiltered[AIndex].RawOffset, FFiltered[AIndex].RawLen);
     for i := 0 to AppSettings.ColorRuleCount - 1 do
       if AppSettings.ColorRules[i].Enabled
          and (AppSettings.ColorRules[i].Pattern <> '')
@@ -711,6 +1025,44 @@ begin
   Result := LevelFgColor(FFiltered[AIndex].Level);
 end;
 
+procedure TfrmMain.lbLogMeasureItem(Control: TWinControl; Index: Integer;
+  var AHeight: Integer);
+var
+  Cvs      : TCanvas;
+  R        : TRect;
+  Flags    : Cardinal;
+  Line     : string;
+  WrapLeft : Integer;
+begin
+  if Control = nil then ;   // suppress "not used" hint
+  Cvs := lbLog.Canvas;
+  Cvs.Font.Assign(lbLog.Font);   // sicherstellen dass der richtige Font verwendet wird
+  AHeight := Cvs.TextHeight('Agqjy') + 4;  // Ag + Unterlängen + Padding
+
+  if AppSettings.WordWrap and (Index >= 0) and (Index < FFilteredCount) then
+  begin
+    Line := FormatLogLine(Index);
+    WrapLeft := 0;
+    if AppSettings.ShowLineNumbers then
+    begin
+      if FSepLineX < 0 then
+        FSepLineX := 2
+          + Cvs.TextWidth(StringOfChar('0', AppSettings.LineNumberWidth))
+          + Cvs.TextWidth(' ');
+      WrapLeft := FSepLineX + 2;
+    end;
+    // Nur den Text-Teil (nach der Zeilennummer) messen
+    R     := Rect(WrapLeft, 0, lbLog.ClientWidth - 2, 32767);
+    Flags := DT_CALCRECT or DT_WORDBREAK or DT_NOPREFIX;
+    if AppSettings.ShowLineNumbers and (WrapLeft > 0) then
+      DrawText(Cvs.Handle,
+        PChar(Copy(Line, AppSettings.LineNumberWidth + 3, MaxInt)), -1, R, Flags)
+    else
+      DrawText(Cvs.Handle, PChar(Line), Length(Line), R, Flags);
+    AHeight := Max(AHeight, R.Bottom - R.Top + 2);
+  end;
+end;
+
 procedure TfrmMain.lbLogDrawItem(Control: TWinControl; Index: Integer;
   ARect: TRect; State: TOwnerDrawState);
 var
@@ -718,9 +1070,13 @@ var
   BgCol  : TColor;
   SepCol : TColor;
   BgRGB, FgRGB : TColor;
+  TextR  : TRect;
+  Flags  : Cardinal;
+  Line   : string;
 begin
   Cvs := lbLog.Canvas;
   if (Index < 0) or (Index > FFilteredCount - 1) then Exit;
+
   if (odSelected in State) or lbLog.Selected[Index] then
   begin
     Cvs.Brush.Color := clHighlight;
@@ -733,17 +1089,51 @@ begin
     Cvs.Font.Color  := FgColorForLine(Index);
   end;
   Cvs.FillRect(ARect);
-  Cvs.TextOut(ARect.Left + 2, ARect.Top + 1, FormatLogLine(Index));
+
+  // Zeichenbreite einmalig vom aktiven Canvas cachen
+  if FCachedCharW <= 0 then
+    FCachedCharW := Max(1, Cvs.TextWidth('0'));
+
+  // Text zeichnen: mit oder ohne Word Wrap
+  Line  := FormatLogLine(Index);
+  TextR := ARect;
+  Inc(TextR.Left, 2);
+  Inc(TextR.Top,  1);
+  if AppSettings.WordWrap then
+  begin
+    if AppSettings.ShowLineNumbers and (FSepLineX > 0) then
+    begin
+      // Zeilennummer ganz links zeichnen (Zeichen 1..LineNumberWidth+2)
+      Cvs.Brush.Style := bsClear;
+      Cvs.TextOut(TextR.Left, TextR.Top,
+        Copy(Line, 1, AppSettings.LineNumberWidth + 2));
+      // Logtext ab Zeichen LineNumberWidth+3, mit WordWrap
+      TextR.Left  := ARect.Left + FSepLineX + 2;
+      TextR.Right := ARect.Right - 2;
+      DrawText(Cvs.Handle,
+        PChar(Copy(Line, AppSettings.LineNumberWidth + 3, MaxInt)),
+        -1, TextR,
+        DT_WORDBREAK or DT_NOPREFIX);
+      Cvs.Brush.Style := bsSolid;
+    end
+    else
+    begin
+      Flags := DT_WORDBREAK or DT_NOPREFIX;
+      Cvs.Brush.Style := bsClear;
+      DrawText(Cvs.Handle, PChar(Line), Length(Line), TextR, Flags);
+      Cvs.Brush.Style := bsSolid;
+    end;
+  end
+  else
+    Cvs.TextOut(TextR.Left, TextR.Top, Line);
 
   // Vertikale Trennlinie zwischen Zeilennummer und Logtext
   if AppSettings.ShowLineNumbers then
   begin
-    // X-Position einmalig berechnen und cachen
     if FSepLineX < 0 then
       FSepLineX := 2
         + Cvs.TextWidth(StringOfChar('0', AppSettings.LineNumberWidth))
         + Cvs.TextWidth(' ');
-    // Linienfarbe: dezent, 30 % vom Hintergrund zum Vordergrund
     if (odSelected in State) or lbLog.Selected[Index] then
       SepCol := clHighlightText
     else
@@ -781,7 +1171,7 @@ begin
         lbLog.Invalidate;
         Exit;
       end;
-    sbStatus.SimpleText := 'No further entry found (forward).';
+    sbpMain.Text := 'No further entry found (forward).';
   end
   else
   begin
@@ -795,7 +1185,7 @@ begin
         lbLog.Invalidate;
         Exit;
       end;
-    sbStatus.SimpleText := 'No further entry found (backward).';
+    sbpMain.Text := 'No further entry found (backward).';
   end;
 end;
 
@@ -852,7 +1242,7 @@ begin
                 end;
       mrRetry : begin
                   FSearchText := '';
-                  sbStatus.SimpleText := 'Search cleared.';
+                  sbpMain.Text := 'Search cleared.';
                 end;
     end;
   finally
@@ -868,7 +1258,7 @@ var
 begin
   if FSearchText = '' then
   begin
-    sbStatus.SimpleText := 'No search term set. Press Ctrl+F to enter one.';
+    sbpMain.Text := 'No search term set. Press Ctrl+F to enter one.';
     Exit;
   end;
   Total := FFilteredCount;
@@ -883,22 +1273,22 @@ begin
     if (Start < 0) or (Start >= Total) then Start := 0;
     // ab Start bis Ende
     for i := Start to Total - 1 do
-      if Pos(Needle, LowerCase(FFiltered[i].Raw)) > 0 then
+      if Pos(Needle, LowerCase(FLog.RawStr(FFiltered[i].RawOffset, FFiltered[i].RawLen))) > 0 then
       begin
         lbLog.ItemIndex := i;
         lbLog.TopIndex  := Max(0, i - 5);
         lbLog.Invalidate;
-        sbStatus.SimpleText := Format('Found: line %d', [FFiltered[i].LineNo]);
+        sbpMain.Text := Format('Found: line %d', [FFiltered[i].LineNo]);
         Exit;
       end;
     // Wrap: von 0 bis Start-1
     for i := 0 to Start - 1 do
-      if Pos(Needle, LowerCase(FFiltered[i].Raw)) > 0 then
+      if Pos(Needle, LowerCase(FLog.RawStr(FFiltered[i].RawOffset, FFiltered[i].RawLen))) > 0 then
       begin
         lbLog.ItemIndex := i;
         lbLog.TopIndex  := Max(0, i - 5);
         lbLog.Invalidate;
-        sbStatus.SimpleText := Format('Found (wrapped): line %d',
+        sbpMain.Text := Format('Found (wrapped): line %d',
           [FFiltered[i].LineNo]);
         Exit;
       end;
@@ -909,27 +1299,27 @@ begin
     if Start < 0 then Start := Total - 1;
     // ab Start rueckwaerts bis 0
     for i := Start downto 0 do
-      if Pos(Needle, LowerCase(FFiltered[i].Raw)) > 0 then
+      if Pos(Needle, LowerCase(FLog.RawStr(FFiltered[i].RawOffset, FFiltered[i].RawLen))) > 0 then
       begin
         lbLog.ItemIndex := i;
         lbLog.TopIndex  := Max(0, i - 5);
         lbLog.Invalidate;
-        sbStatus.SimpleText := Format('Found: line %d', [FFiltered[i].LineNo]);
+        sbpMain.Text := Format('Found: line %d', [FFiltered[i].LineNo]);
         Exit;
       end;
     // Wrap: von Ende bis Start+1
     for i := Total - 1 downto Start + 1 do
-      if Pos(Needle, LowerCase(FFiltered[i].Raw)) > 0 then
+      if Pos(Needle, LowerCase(FLog.RawStr(FFiltered[i].RawOffset, FFiltered[i].RawLen))) > 0 then
       begin
         lbLog.ItemIndex := i;
         lbLog.TopIndex  := Max(0, i - 5);
         lbLog.Invalidate;
-        sbStatus.SimpleText := Format('Found (wrapped): line %d',
+        sbpMain.Text := Format('Found (wrapped): line %d',
           [FFiltered[i].LineNo]);
         Exit;
       end;
   end;
-  sbStatus.SimpleText := Format('"%s" not found.', [FSearchText]);
+  sbpMain.Text := Format('"%s" not found.', [FSearchText]);
 end;
 
 procedure TfrmMain.ShowFilterDialog;
@@ -1085,10 +1475,10 @@ begin
   try
     for i := 0 to lbLog.Items.Count - 1 do
       if lbLog.Selected[i] then
-        SL.Add(FFiltered[i].Raw);
+        SL.Add(FLog.RawStr(FFiltered[i].RawOffset, FFiltered[i].RawLen));
     if (SL.Count = 0) and (lbLog.ItemIndex >= 0)
        and (lbLog.ItemIndex <= FFilteredCount - 1) then
-      SL.Add(FFiltered[lbLog.ItemIndex].Raw);
+      SL.Add(FLog.RawStr(FFiltered[lbLog.ItemIndex].RawOffset, FFiltered[lbLog.ItemIndex].RawLen));
     if SL.Count > 0 then
       Clipboard.AsText := SL.Text;
   finally
@@ -1103,7 +1493,7 @@ begin
   SL := TStringList.Create;
   try
     for i := 0 to FFilteredCount - 1 do
-      SL.Add(FFiltered[i].Raw);
+      SL.Add(FLog.RawStr(FFiltered[i].RawOffset, FFiltered[i].RawLen));
     Clipboard.AsText := SL.Text;
   finally
     SL.Free;
@@ -1114,29 +1504,32 @@ procedure TfrmMain.OnTailNewLine(const ALine: string; ALineNo: Integer);
 var
   idx     : Integer;
   P       : PLogEntry;
+  RawOff  : Integer;
   Matched : Boolean;
 begin
+  // Rohzeile in Puffer schreiben
+  RawOff := FLog.AppendRaw(PAnsiChar(AnsiString(ALine)), Length(ALine));
   idx := FLog.PrepareAdd;
   TLogParser.ParseLine(ALine, ALineNo, FCurrentFmt, FLog.Slot(idx)^);
+  FLog.Slot(idx)^.RawOffset := RawOff;
+  FLog.Slot(idx)^.RawLen    := Length(ALine);
   FLog.CommitAdd;
   P := FLog.Slot(idx);
 
   if FFilteredDirect then
   begin
-    // FFiltered zeigt direkt auf RawItems — nach Grow evtl. umalloziert
     FFiltered := FLog.RawItems;
     FFilteredCount := FLog.Count;
     UpdateStatsForEntry(P^);
-    lbLog.Items.Add('');
+    lbLog.AppendVirtualItem;
     if FFollowTail then
     begin
-      lbLog.ItemIndex := lbLog.Items.Count - 1;
+      lbLog.ItemIndex := FFilteredCount - 1;
       lbLog.TopIndex  := lbLog.ItemIndex;
     end;
   end
   else
   begin
-    // Filter aktiv — nur matching Eintraege anhaengen
     Matched := FFilter.Matches(P^);
     if Matched then
     begin
@@ -1144,10 +1537,10 @@ begin
       SetLength(FFiltered, FFilteredCount);
       FFiltered[FFilteredCount - 1] := P^;
       UpdateStatsForEntry(P^);
-      lbLog.Items.Add('');
+      lbLog.AppendVirtualItem;
       if FFollowTail then
       begin
-        lbLog.ItemIndex := lbLog.Items.Count - 1;
+        lbLog.ItemIndex := FFilteredCount - 1;
         lbLog.TopIndex  := lbLog.ItemIndex;
       end;
     end;
@@ -1187,7 +1580,10 @@ end;
 procedure TfrmMain.DoWordWrap(Sender: TObject);
 begin
   AppSettings.WordWrap    := not AppSettings.WordWrap;
-  mniWordWrap.Checked     := AppSettings.WordWrap;
+  mniWordWrap.Checked := AppSettings.WordWrap;
+  lbLog.Style := lbOwnerDrawFixed;
+  lbLog.Style := lbOwnerDrawVariable;
+  UpdateHorzScrollbar;
 end;
 
 procedure TfrmMain.DoOptionen(Sender: TObject);
@@ -1202,7 +1598,7 @@ end;
 procedure TfrmMain.DoSucheReset(Sender: TObject);
 begin
   FSearchText := '';
-  sbStatus.SimpleText := 'Search cleared.';
+  sbpMain.Text := 'Search cleared.';
 end;
 
 procedure TfrmMain.DoFilterReset(Sender: TObject);
@@ -1238,6 +1634,14 @@ end;
 
 procedure TfrmMain.DoQuickSearch(Sender: TObject);
 begin
+  // Debounce: Timer neu starten, Filter erst nach 100ms Pause anwenden
+  FFilterTimer.Enabled := False;
+  FFilterTimer.Enabled := True;
+end;
+
+procedure TfrmMain.FilterTimerFired(Sender: TObject);
+begin
+  FFilterTimer.Enabled := False;
   DisableFollowTemp;
   FFilter.Text := edtQuickSearch.Text;
   ApplyFilterAndRefresh;
@@ -1261,9 +1665,31 @@ begin
   lblQuickSearch.Left  := edtQuickSearch.Left - lblQuickSearch.Width - 6;
 end;
 
+procedure TfrmMain.UpdateHorzScrollbar;
+begin
+  if AppSettings.WordWrap or not AppSettings.ShowHorzScrollbar then
+    lbLog.ScrollWidth := 0
+  else
+    lbLog.ScrollWidth := FMaxLineWidth + 8;
+end;
+
 procedure TfrmMain.FormResizeHandler(Sender: TObject);
 begin
   PositionQuickSearch;
+  UpdateHorzScrollbar;
+  // WordWrap-Neuberechnung erst wenn Resize beendet (Timer-Debounce)
+  if AppSettings.WordWrap then
+  begin
+    FResizeTimer.Enabled := False;
+    FResizeTimer.Enabled := True;
+  end;
+end;
+
+procedure TfrmMain.ResizeTimerFired(Sender: TObject);
+begin
+  FResizeTimer.Enabled := False;
+  lbLog.Style := lbOwnerDrawFixed;
+  lbLog.Style := lbOwnerDrawVariable;
 end;
 
 procedure TfrmMain.FormClose(Sender: TObject; var CloseAction: TCloseAction);

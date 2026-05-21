@@ -5,20 +5,22 @@ unit uLogFilter;
 interface
 
 uses
-  SysUtils, uLogTypes, uLogModel, uLogParser;
+  SysUtils, uLogTypes, uLogModel;
 
 type
   TFilterSpec = class
   private
+    FLogList   : TLogList;
     FText      : string;
-    FTextLower : string;        // gecachte Lowercase-Version von FText
+    FTextLower : string;
     FLevels    : TLevelSet;
     procedure SetText(const V: string);
   public
-    constructor Create;
+    constructor Create(ALogList: TLogList);
     procedure Reset;
-    property Text   : string    read FText   write SetText;
-    property Levels : TLevelSet read FLevels write FLevels;
+    property Text    : string    read FText    write SetText;
+    property Levels  : TLevelSet read FLevels  write FLevels;
+    property LogList : TLogList  read FLogList write FLogList;
     function IsActive: Boolean;
     function Matches(const AEntry: TLogEntry): Boolean;
     function Apply(const AList: TLogList; out ACount: Integer): TLogEntryArray;
@@ -29,10 +31,11 @@ const
 
 implementation
 
-constructor TFilterSpec.Create;
+constructor TFilterSpec.Create(ALogList: TLogList);
 begin
   inherited Create;
-  FLevels := AllLevels;
+  FLogList := ALogList;
+  FLevels  := AllLevels;
 end;
 
 procedure TFilterSpec.SetText(const V: string);
@@ -53,10 +56,18 @@ begin
 end;
 
 function TFilterSpec.Matches(const AEntry: TLogEntry): Boolean;
+var
+  RawS : string;
 begin
-  Result := (AEntry.Level in FLevels);
+  Result := AEntry.Level in FLevels;
   if Result and (FTextLower <> '') then
-    Result := Pos(FTextLower, LowerCase(AEntry.Raw)) > 0;
+  begin
+    if Assigned(FLogList) then
+      RawS := FLogList.RawStr(AEntry.RawOffset, AEntry.RawLen)
+    else
+      RawS := '';
+    Result := Pos(FTextLower, LowerCase(RawS)) > 0;
+  end;
 end;
 
 function TFilterSpec.Apply(const AList: TLogList;
@@ -69,7 +80,6 @@ begin
   N   := AList.Count;
   Arr := AList.RawItems;
 
-  // Fast-Path: kein Filter aktiv → Direkt-Referenz, keine Kopie
   if not IsActive then
   begin
     Result := Arr;
@@ -77,7 +87,6 @@ begin
     Exit;
   end;
 
-  // Pass 1: Treffer zaehlen
   cnt := 0;
   for i := 0 to N - 1 do
     if Matches(Arr[i]) then Inc(cnt);
@@ -85,7 +94,6 @@ begin
   SetLength(Result, cnt);
   ACount := cnt;
 
-  // Pass 2: kopieren
   cnt := 0;
   for i := 0 to N - 1 do
     if Matches(Arr[i]) then

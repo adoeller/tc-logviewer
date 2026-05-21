@@ -83,9 +83,10 @@ var
   Buf     : RawByteString;
   Delta   : Int64;
   S       : string;
-  P, StartCharacter: Integer;
+  P, LineStart: Integer;
 begin
   if FFileName = '' then Exit;
+  Buf := '';   // suppress uninitialized hint; SetLength fills before use
 
   // Aktuelle Dateigroesse ermitteln
   NewSize := 0;
@@ -120,26 +121,26 @@ begin
   FPartial := '';
 
   // Zeilenweise aufteilen und ausgeben
-  StartCharacter := 1;
+  LineStart := 1;
   for P := 1 to Length(S) do
   begin
     if S[P] = #10 then
     begin
       // Zeile extrahieren (CR vor LF entfernen)
-      if (P > StartCharacter) and (S[P - 1] = #13) then
-        Buf := Copy(S, StartCharacter, P - StartCharacter - 1)
+      if (P > LineStart) and (S[P - 1] = #13) then
+        Buf := Copy(S, LineStart, P - LineStart - 1)
       else
-        Buf := Copy(S, StartCharacter, P - StartCharacter);
+        Buf := Copy(S, LineStart, P - LineStart);
       Inc(FLastLineNo);
       if Assigned(FOnNewLine) then
         FOnNewLine(string(Buf), FLastLineNo);
-      StartCharacter := P + 1;
+      LineStart := P + 1;
     end;
   end;
 
   // Unvollstaendige letzte Zeile fuer naechsten Tick aufheben
-  if StartCharacter <= Length(S) then
-    FPartial := Copy(S, StartCharacter, MaxInt);
+  if LineStart <= Length(S) then
+    FPartial := Copy(S, LineStart, MaxInt);
 end;
 
 end.

@@ -28,6 +28,7 @@ type
     spnLineWidth   : TSpinEdit;
     lblLineWidth   : TLabel;
     chkWordWrap    : TCheckBox;
+    chkHorzScroll  : TCheckBox;
     cmbFontName    : TComboBox;
     btnPickFont    : TButton;
     lblFontPreview : TLabel;
@@ -242,8 +243,15 @@ begin
   chkWordWrap         := TCheckBox.Create(Self);
   chkWordWrap.Parent  := pnlView;
   chkWordWrap.Left    := 10; chkWordWrap.Top := y;
-  chkWordWrap.Caption := 'Word Wrap (saved, no effect on ListBox currently)';
-  chkWordWrap.Width   := 380;
+  chkWordWrap.Caption := 'Word Wrap';
+  chkWordWrap.Width   := 200;
+  Inc(y, 26);
+
+  chkHorzScroll         := TCheckBox.Create(Self);
+  chkHorzScroll.Parent  := pnlView;
+  chkHorzScroll.Left    := 10; chkHorzScroll.Top := y;
+  chkHorzScroll.Caption := 'Horizontal Scrollbar (disabled when Word Wrap is on)';
+  chkHorzScroll.Width   := 380;
   Inc(y, 36);
 
   L(pnlView, 'Font:', 10, y + 3);
@@ -669,6 +677,7 @@ begin
   chkLineNumbers.Checked := AppSettings.ShowLineNumbers;
   spnLineWidth.Value     := AppSettings.LineNumberWidth;
   chkWordWrap.Checked    := AppSettings.WordWrap;
+  chkHorzScroll.Checked  := AppSettings.ShowHorzScrollbar;
   cmbFontName.Text       := AppSettings.FontName;
   lblFontPreview.Font.Name := AppSettings.FontName;
   lblFontPreview.Font.Size := AppSettings.FontSize;
@@ -877,6 +886,7 @@ begin
   AppSettings.ShowLineNumbers := chkLineNumbers.Checked;
   AppSettings.LineNumberWidth := spnLineWidth.Value;
   AppSettings.WordWrap        := chkWordWrap.Checked;
+  AppSettings.ShowHorzScrollbar := chkHorzScroll.Checked;
   AppSettings.FontName        := cmbFontName.Text;
   AppSettings.FontSize        := spnFontSize.Value;
 

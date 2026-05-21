@@ -300,8 +300,6 @@ var
 begin
   AResult.Format    := lfLog4x;
   AResult.Level     := lCustom;
-  AResult.Source    := '';
-  AResult.Thread    := '';
   AResult.TimeStamp := 0;
 
   if not TryParseLog4xDate(ALine, DT) then Exit;
@@ -351,7 +349,6 @@ begin
       P2 := Pos(']', Rest);
       if P2 > 1 then
       begin
-        AResult.Thread := Trim(Copy(Rest, 2, P2 - 2));
         Rest := Trim(Copy(Rest, P2 + 1, MaxInt));
       end;
     end
@@ -360,7 +357,6 @@ begin
       P2 := Pos(')', Rest);
       if P2 > 1 then
       begin
-        AResult.Thread := Trim(Copy(Rest, 2, P2 - 2));
         Rest := Trim(Copy(Rest, P2 + 1, MaxInt));
       end;
     end;
@@ -369,7 +365,6 @@ begin
   // " - " als Trenner: Source vor dem Trenner
   P1 := Pos(' - ', Rest);
   if P1 > 0 then
-    AResult.Source := Trim(Copy(Rest, 1, P1 - 1));
 end;
 
 class procedure TLogParser.ParseApache(const ALine: string; out AResult: TLogEntry);
@@ -380,12 +375,9 @@ var
 begin
   AResult.Format    := lfApache;
   AResult.Level     := lInfo;
-  AResult.Source    := '';
-  AResult.Thread    := '';
   AResult.TimeStamp := 0;
 
   P1 := Pos(' ', ALine);
-  if P1 > 0 then AResult.Source := Copy(ALine, 1, P1 - 1);
 
   P1 := Pos('[', ALine);
   P2 := Pos(']', ALine);
@@ -423,8 +415,6 @@ var
 begin
   AResult.Format    := lfSyslog;
   AResult.Level     := lInfo;
-  AResult.Source    := '';
-  AResult.Thread    := '';
   AResult.TimeStamp := 0;
 
   // RFC-3164 Priority-Prefix <nnn> entfernen
@@ -442,7 +432,6 @@ begin
   DateStr := Parts[0] + ' ' + Parts[1] + ' ' + Parts[2];
   TryParseSyslogDate(DateStr, DT);
   AResult.TimeStamp := DT;
-  AResult.Source    := Parts[3];
   MsgPart := '';
   if Length(Parts) >= 5 then MsgPart := Parts[4];
   if Length(Parts) >= 6 then MsgPart := MsgPart + ' ' + Parts[5];
@@ -502,8 +491,6 @@ var
 begin
   AResult.Format    := lfCSV;
   AResult.Level     := lCustom;
-  AResult.Source    := '';
-  AResult.Thread    := '';
   AResult.TimeStamp := 0;
   Fields := SplitCSV(ALine);
   if Length(Fields) = 0 then Exit;
@@ -517,7 +504,6 @@ begin
   else
     AResult.TimeStamp := DT;
   if Length(Fields) >= 2 then AResult.Level  := LevelFromStr(Trim(Fields[1]));
-  if Length(Fields) >= 3 then AResult.Source := Trim(Fields[2]);
 end;
 
 class procedure TLogParser.ParseJSON(const ALine: string; out AResult: TLogEntry);
@@ -543,8 +529,6 @@ var
 begin
   AResult.Format    := lfJSON;
   AResult.Level     := lCustom;
-  AResult.Source    := '';
-  AResult.Thread    := '';
   AResult.TimeStamp := 0;
   TS := JSONValue(ALine, 'timestamp');
   if TS = '' then TS := JSONValue(ALine, 'time');
@@ -553,9 +537,6 @@ begin
   AResult.Level   := LevelFromStr(JSONValue(ALine, 'level'));
   if AResult.Level = lCustom then
     AResult.Level := LevelFromStr(JSONValue(ALine, 'severity'));
-  AResult.Source  := JSONValue(ALine, 'logger');
-  if AResult.Source = '' then AResult.Source := JSONValue(ALine, 'class');
-  AResult.Thread  := JSONValue(ALine, 'thread');
 end;
 
 class procedure TLogParser.ParseIIS(const ALine: string; out AResult: TLogEntry);
@@ -566,14 +547,11 @@ var
 begin
   AResult.Format    := lfIIS;
   AResult.Level     := lInfo;
-  AResult.Source    := '';
-  AResult.Thread    := '';
   AResult.TimeStamp := 0;
   if (Length(ALine) > 0) and (ALine[1] = '#') then Exit;
   Fields := ALine.Split([' ']);
   if Length(Fields) < 2 then Exit;
   if TryParseIISDate(Fields[0], Fields[1], DT) then AResult.TimeStamp := DT;
-  if Length(Fields) >= 3 then AResult.Source  := Fields[2];
   if Length(Fields) >= 12 then
   begin
     Code := Fields[11];
@@ -638,8 +616,6 @@ var
 begin
   AResult.Format    := lfPlain;
   AResult.Level     := lCustom;
-  AResult.Source    := '';
-  AResult.Thread    := '';
   AResult.TimeStamp := 0;
   if Trim(ALine) = '' then Exit;
 
@@ -927,8 +903,6 @@ var
 begin
   AResult.Format    := lfCustom;
   AResult.Level     := lCustom;
-  AResult.Source    := '';
-  AResult.Thread    := '';
   AResult.TimeStamp := 0;
 
   Cfg := AppSettings.CustomFormat;
@@ -967,10 +941,7 @@ begin
           end;
         cfrLevel:
           AResult.Level := LevelFromStr(UpperCase(S));
-        cfrSource:
-          AResult.Source := S;
-        cfrThread:
-          AResult.Thread := S;
+        // cfrSource, cfrThread, cfrIgnore: kein persistentes Feld mehr
       end;
     end;
   end
@@ -997,7 +968,6 @@ begin
       AResult.Level := LevelFromStr(UpperCase(S));
     end;
     if (Cfg.SrcStart > 0) and (Cfg.SrcLen > 0) then
-      AResult.Source := Trim(Copy(ALine, Cfg.SrcStart, Cfg.SrcLen));
   end;
 end;
 
@@ -1019,7 +989,7 @@ begin
   if AResult.Level = lCustom then
     AResult.Level := KeywordScanLevel(ALine, UpperCase(ALine));
   AResult.LineNo := ALineNo;
-  AResult.Raw    := ALine;
+  // RawOffset/RawLen werden vom Aufrufer gesetzt (TLogList.AppendRaw)
 end;
 
 end.

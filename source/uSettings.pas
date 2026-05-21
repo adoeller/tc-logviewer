@@ -50,6 +50,7 @@ type
     ShowLineNumbers   : Boolean;
     LineNumberWidth   : Integer;
     WordWrap          : Boolean;
+    ShowHorzScrollbar : Boolean;
     FontName          : string;
     FontSize          : Integer;
     // Theme
@@ -227,6 +228,7 @@ begin
   AppSettings.ShowLineNumbers  := True;
   AppSettings.LineNumberWidth  := 5;
   AppSettings.WordWrap         := False;
+  AppSettings.ShowHorzScrollbar := False;
   AppSettings.FontName         := 'Courier New';
   AppSettings.FontSize         := 9;
   AppSettings.ThemeMode        := tmSystem;
@@ -323,6 +325,7 @@ begin
     if AppSettings.LineNumberWidth < 1 then AppSettings.LineNumberWidth := 1;
     if AppSettings.LineNumberWidth > 9 then AppSettings.LineNumberWidth := 9;
     AppSettings.WordWrap         := Ini.ReadBool   ('View',   'WordWrap',        AppSettings.WordWrap);
+    AppSettings.ShowHorzScrollbar := Ini.ReadBool   ('View',   'HorzScrollbar',   AppSettings.ShowHorzScrollbar);
     AppSettings.FontName         := Ini.ReadString ('View',   'FontName',        AppSettings.FontName);
     AppSettings.FontSize         := Ini.ReadInteger('View',   'FontSize',        AppSettings.FontSize);
 
@@ -416,6 +419,7 @@ begin
     Ini.WriteBool   ('View',   'ShowLineNumbers', AppSettings.ShowLineNumbers);
     Ini.WriteInteger('View',   'LineNumWidth',    AppSettings.LineNumberWidth);
     Ini.WriteBool   ('View',   'WordWrap',        AppSettings.WordWrap);
+    Ini.WriteBool   ('View',   'HorzScrollbar',   AppSettings.ShowHorzScrollbar);
     Ini.WriteString ('View',   'FontName',        AppSettings.FontName);
     Ini.WriteInteger('View',   'FontSize',        AppSettings.FontSize);
 
