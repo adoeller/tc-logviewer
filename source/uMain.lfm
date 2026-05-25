@@ -1,0 +1,71 @@
+object frmMain: TfrmMain
+  Left = 100
+  Height = 600
+  Top = 80
+  Width = 900
+  Caption = 'LogViewer'
+  ClientHeight = 600
+  ClientWidth = 900
+  LCLVersion = '4.6.0.0'
+  object lbLog: TListBox
+    Left = 0
+    Height = 575
+    Top = 0
+    Width = 900
+    Align = alClient
+    Font.Height = -12
+    Font.Name = 'Courier New'
+    ItemHeight = 0
+    ParentFont = False
+    TabOrder = 0
+  end
+  object sbStatus: TStatusBar
+    Left = 0
+    Height = 25
+    Top = 575
+    Width = 900
+    Panels = <>
+  end
+  object MainMenu1: TMainMenu
+    Left = 8
+    Top = 8
+    object mniDatei: TMenuItem
+      Caption = '&Datei'
+      object mniOeffnen: TMenuItem
+        Caption = '&Oeffnen...'
+        ShortCut = 16463
+      end
+      object mniTrenner1: TMenuItem
+        Caption = '-'
+      end
+      object mniBeenden: TMenuItem
+        Caption = '&Beenden'
+        ShortCut = 32883
+      end
+    end
+    object mniSuchen: TMenuItem
+      Caption = '&Suchen'
+      object mniSucheDialog: TMenuItem
+        Caption = '&Suche...'
+        ShortCut = 16454
+      end
+    end
+    object mniNavigation: TMenuItem
+      Caption = '&Navigation'
+      object mniNavNextError: TMenuItem
+        Caption = 'Naechster Fehler/Warnung'
+        ShortCut = 116
+      end
+      object mniNavPrevError: TMenuItem
+        Caption = 'Vorheriger Fehler/Warnung'
+        ShortCut = 8308
+      end
+    end
+  end
+  object OpenDialog: TOpenDialog
+    Filter = 'Logdateien|*.log;*.txt|Alle Dateien|*.*'
+    Options = [ofFileMustExist, ofEnableSizing]
+    Left = 40
+    Top = 40
+  end
+end

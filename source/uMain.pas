@@ -10,20 +10,9 @@ uses
   Clipbrd, Spin, Math,
   DateTimePicker,
   uLogTypes, uLogModel, uLogParser, uLogFilter,
-  uSettings, uFormats, uTailWatcher, uOptionsDlg;
+  uSettings, uFormats, uTailWatcher, uOptionsDlg, uLogView;
 
 type
-
-  { TVirtualListBox – LBS_NODATA erlaubt LB_SETCOUNT (O(1) statt 1M LB_ADDSTRING) }
-  TVirtualListBox = class(TListBox)
-  private
-    FNoData : Boolean;   // True wenn LBS_NODATA erfolgreich gesetzt wurde
-  protected
-    procedure CreateParams(var Params: TCreateParams); override;
-  public
-    procedure SetVirtualCount(ACount: Integer);   // bulk: loescht + setzt
-    procedure AppendVirtualItem;                  // tail: haengt einzeln an, kein Reset
-  end;
 
   TfrmMain = class(TForm)
   private
@@ -50,7 +39,7 @@ type
     btnClearSearch : TSpeedButton;
     lblQuickSearch : TLabel;
     FFollowTail    : Boolean;
-    lbLog         : TVirtualListBox;
+    lbLog         : TLogView;
     sbStatus      : TStatusBar;
     sbpMain       : TStatusPanel;   // Dateiname + Zeilen
     sbpEWI        : TStatusPanel;   // E/W/I Counts (fett je nach neuestem)
@@ -160,65 +149,7 @@ implementation
 const
   READ_BUF_SIZE = 131072;   // 128 KB I/O-Puffer
 
-{ TVirtualListBox }
-
-procedure TVirtualListBox.CreateParams(var Params: TCreateParams);
-const
-  LBS_HASSTRINGS = $0040;
-  LBS_NODATA     = $2000;
-begin
-  inherited CreateParams(Params);
-  // LBS_NODATA: Listbox speichert keine Strings → LB_SETCOUNT wird unterstuetzt
-  Params.Style := (Params.Style and (not LBS_HASSTRINGS)) or LBS_NODATA;
-end;
-
-procedure TVirtualListBox.SetVirtualCount(ACount: Integer);
-const
-  LB_RESETCONTENT = $0184;
-  LB_SETCOUNT     = $01A7;
-  LB_GETCOUNT     = $018B;
-var
-  SL : TStringList;
-  i  : Integer;
-begin
-  {$IFDEF WINDOWS}
-  SendMessage(Handle, LB_RESETCONTENT, 0, 0);
-  SendMessage(Handle, LB_SETCOUNT, LongWord(ACount), 0);
-  FNoData := SendMessage(Handle, LB_GETCOUNT, 0, 0) = ACount;
-  if FNoData then Exit;
-  {$ENDIF}
-  // Fallback: LBS_NODATA nicht aktiv
-  SL := TStringList.Create;
-  try
-    SL.Capacity := ACount;
-    for i := 0 to ACount - 1 do SL.Add('');
-    Items.BeginUpdate;
-    try
-      Items.Assign(SL);
-    finally
-      Items.EndUpdate;
-    end;
-  finally
-    SL.Free;
-  end;
-end;
-
-procedure TVirtualListBox.AppendVirtualItem;
-const
-  LB_SETCOUNT = $01A7;
-  LB_GETCOUNT = $018B;
-begin
-  {$IFDEF WINDOWS}
-  if FNoData then
-  begin
-    // Zaehler ohne Reset erhoehen — kein Flimmern, kein Loeschen
-    SendMessage(Handle, LB_SETCOUNT,
-      SendMessage(Handle, LB_GETCOUNT, 0, 0) + 1, 0);
-    Exit;
-  end;
-  {$ENDIF}
-  Items.Add('');
-end;
+{ TfrmMain }
 
 procedure TfrmMain.DisableFollowTemp;
 begin
@@ -228,10 +159,9 @@ end;
 
 procedure TfrmMain.ScrollToEndCurrent;
 begin
-  if FFollowTail and (lbLog.Items.Count > 0) then
+  if FFollowTail and (FFilteredCount > 0) then
   begin
-    lbLog.ItemIndex := lbLog.Items.Count - 1;
-    lbLog.TopIndex  := lbLog.ItemIndex;
+    lbLog.ScrollToEnd;
   end;
 end;
 
@@ -320,10 +250,9 @@ begin
   if ParamCount > 0 then
     LoadFile(ParamStr(1));
   // Wenn Follow beim Start aktiv: direkt ans Ende springen
-  if FFollowTail and (lbLog.Items.Count > 0) then
+  if FFollowTail and (FFilteredCount > 0) then
   begin
-    lbLog.ItemIndex := lbLog.Items.Count - 1;
-    lbLog.TopIndex  := lbLog.ItemIndex;
+    lbLog.ScrollToEnd;
   end;
 end;
 
@@ -518,15 +447,14 @@ begin
   btnClearSearch.Hint    := 'Clear filter  (Ctrl+Shift+F)';
   btnClearSearch.ShowHint := True;
 
-  lbLog                := TVirtualListBox.Create(Self);
-  lbLog.Parent         := Self;
-  lbLog.Align          := alClient;
-  lbLog.Style           := lbOwnerDrawVariable;
-  lbLog.ItemHeight      := 16;   // Minimum / Fallback
-  lbLog.MultiSelect     := True;
-  lbLog.ExtendedSelect  := True;
-  lbLog.OnDrawItem      := @lbLogDrawItem;
-  lbLog.OnMeasureItem   := @lbLogMeasureItem;
+  lbLog                  := TLogView.Create(Self);
+  lbLog.Parent           := Self;
+  lbLog.Align            := alClient;
+  lbLog.Color            := AppSettings.BgDefault;
+  lbLog.Font.Name        := AppSettings.FontName;
+  lbLog.Font.Size        := AppSettings.FontSize;
+  lbLog.OnDrawItem       := @lbLogDrawItem;
+  lbLog.OnMeasureItem    := @lbLogMeasureItem;
 
   PopupMenu1        := TPopupMenu.Create(Self);
   mniPopCopy        := TMenuItem.Create(PopupMenu1);
@@ -605,20 +533,20 @@ end;
 
 procedure TfrmMain.ApplyAppSettings;
 begin
-  ApplyThemeColors;   // aktives Farbset berechnen
+  ApplyThemeColors;
   lbLog.Font.Name     := AppSettings.FontName;
   lbLog.Font.Size     := AppSettings.FontSize;
   mniLineNr.Checked   := AppSettings.ShowLineNumbers;
   mniWordWrap.Checked := AppSettings.WordWrap;
-  FSepLineX    := -1;   // Trennlinien-Position neu berechnen lassen
-  FCachedCharW := 0;    // Zeichenbreite neu berechnen lassen
+  FSepLineX    := -1;
+  FCachedCharW := 0;
   ApplyThemeToUI;
-  // Hoehen-Cache der ListBox zuruecksetzen: Style kurz toggeln
-  // erzwingt erneutes OnMeasureItem fuer alle Items
-  lbLog.Style := lbOwnerDrawFixed;
-  lbLog.Style := lbOwnerDrawVariable;
+  lbLog.UpdateFont;
   UpdateHorzScrollbar;
-end;function TfrmMain.GetFileSizeByName(const AFilename: string): Int64;
+end;
+
+
+function TfrmMain.GetFileSizeByName(const AFilename: string): Int64;
 var SR: TSearchRec;
 begin
   Result := 0;
@@ -722,7 +650,7 @@ begin
   FFiltered     := nil;
   FFilteredCount:= 0;
   FFilteredDirect := False;
-  lbLog.Items.Clear;
+  lbLog.Clear;
   FLog.Clear;
   FFilter.Reset;
   edtQuickSearch.Text := '';
@@ -967,7 +895,13 @@ begin
     Inc(FMaxLineWidth, FSepLineX + 4);
 
   // Eine einzige Win32-Nachricht statt 1M × LB_ADDSTRING
-  lbLog.SetVirtualCount(FFilteredCount);
+  lbLog.SetCount(FFilteredCount);
+
+  // Nach dem Laden: letzte Zeile unten wenn Follow aktiv
+  if FFollowTail and (FFilteredCount > 0) then
+  begin
+    lbLog.ScrollToEnd;
+  end;
 
   UpdateHorzScrollbar;
   FFileSize := GetFileSizeByName(FFileName);
@@ -1473,7 +1407,7 @@ var
 begin
   SL := TStringList.Create;
   try
-    for i := 0 to lbLog.Items.Count - 1 do
+    for i := 0 to FFilteredCount - 1 do
       if lbLog.Selected[i] then
         SL.Add(FLog.RawStr(FFiltered[i].RawOffset, FFiltered[i].RawLen));
     if (SL.Count = 0) and (lbLog.ItemIndex >= 0)
@@ -1521,11 +1455,10 @@ begin
     FFiltered := FLog.RawItems;
     FFilteredCount := FLog.Count;
     UpdateStatsForEntry(P^);
-    lbLog.AppendVirtualItem;
+    lbLog.AppendItem;
     if FFollowTail then
     begin
-      lbLog.ItemIndex := FFilteredCount - 1;
-      lbLog.TopIndex  := lbLog.ItemIndex;
+      lbLog.ScrollToEnd;
     end;
   end
   else
@@ -1537,12 +1470,9 @@ begin
       SetLength(FFiltered, FFilteredCount);
       FFiltered[FFilteredCount - 1] := P^;
       UpdateStatsForEntry(P^);
-      lbLog.AppendVirtualItem;
+      lbLog.AppendItem;
       if FFollowTail then
-      begin
-        lbLog.ItemIndex := FFilteredCount - 1;
-        lbLog.TopIndex  := lbLog.ItemIndex;
-      end;
+        lbLog.ScrollToEnd;
     end;
   end;
   FFileSize := GetFileSizeByName(FFileName);
@@ -1579,11 +1509,10 @@ end;
 
 procedure TfrmMain.DoWordWrap(Sender: TObject);
 begin
-  AppSettings.WordWrap    := not AppSettings.WordWrap;
-  mniWordWrap.Checked := AppSettings.WordWrap;
-  lbLog.Style := lbOwnerDrawFixed;
-  lbLog.Style := lbOwnerDrawVariable;
+  AppSettings.WordWrap := not AppSettings.WordWrap;
+  mniWordWrap.Checked  := AppSettings.WordWrap;
   UpdateHorzScrollbar;
+  lbLog.Invalidate;
 end;
 
 procedure TfrmMain.DoOptionen(Sender: TObject);
@@ -1677,7 +1606,6 @@ procedure TfrmMain.FormResizeHandler(Sender: TObject);
 begin
   PositionQuickSearch;
   UpdateHorzScrollbar;
-  // WordWrap-Neuberechnung erst wenn Resize beendet (Timer-Debounce)
   if AppSettings.WordWrap then
   begin
     FResizeTimer.Enabled := False;
@@ -1688,8 +1616,7 @@ end;
 procedure TfrmMain.ResizeTimerFired(Sender: TObject);
 begin
   FResizeTimer.Enabled := False;
-  lbLog.Style := lbOwnerDrawFixed;
-  lbLog.Style := lbOwnerDrawVariable;
+  lbLog.Invalidate;   // TLogView remeasures visible lines on next Paint
 end;
 
 procedure TfrmMain.FormClose(Sender: TObject; var CloseAction: TCloseAction);
