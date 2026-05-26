@@ -986,7 +986,9 @@ begin
   else
     ParsePlain(ALine, AResult);
   end;
-  if AResult.Level = lCustom then
+  // For structured formats with explicit level field, do not override the
+  // class from a full-line keyword scan (e.g. quoted CSV message containing "error").
+  if (AResult.Level = lCustom) and (AFormat <> lfCSV) and (AFormat <> lfCustom) then
     AResult.Level := KeywordScanLevel(ALine, UpperCase(ALine));
   AResult.LineNo := ALineNo;
   // RawOffset/RawLen werden vom Aufrufer gesetzt (TLogList.AppendRaw)
