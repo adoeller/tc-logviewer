@@ -1,4 +1,4 @@
-name: Manuelles Release (vorhandene Assets + optionales Source-Archiv)
+name: Manuelles Release (vorhandene Assets + optionale Ordner)
 
 on:
   workflow_dispatch:
@@ -45,13 +45,16 @@ jobs:
           set -e
           find . -type f \( \
               -iname "*.wdx" -o -iname "*.wcx" -o -iname "*.wfx" -o -iname "*.wlx" \
-              -o -iname "*.wdx64" -o -iname "*.wcx64" -o -iname "*.wfx64" -o -iname "*.wlx64"\
+              -o -iname "*.wdx64" -o -iname "*.wcx64" -o -iname "*.wfx64" -o -iname "*.wlx64" \
+              -o -iname "*.exe" -o -iname "*32.exe" -o -iname "*64.exe" \
               -o -iname "*.zip" \
-              -o -iname "./DLL/*" \
-              -o -iname "./standalone/*" \
               -o -iname "readme*" \
               -o -iname "license*" -o -iname "lizenz*" \
-            \) ! -path "./.git/*" ! -path "./source/*" > assets.txt
+            \) ! -path "./.git/*" \
+              ! -path "./source/*" \
+              ! -path "./DLL/*" \
+              ! -path "./standalone/*" \
+            > assets.txt
 
           if [ ! -s assets.txt ]; then
             echo "Keine passenden Dateien im Repository gefunden – Abbruch." >&2
@@ -59,16 +62,20 @@ jobs:
           fi
           cat assets.txt
 
-      - name: Source-Archiv erstellen (falls Ordner vorhanden)
+      - name: Optionale Ordner archivieren (source, DLL, standalone)
+        id: folders
         run: |
-          if [ -d "source" ]; then
-            SOURCE_ZIP="${{ steps.meta.outputs.tag_name }}-source.zip"
-            (cd source && zip -r "../$SOURCE_ZIP" .)
-            echo "$SOURCE_ZIP" > source_asset.txt
-          else
-            echo "Kein 'source'-Ordner gefunden, überspringe Source-Archiv."
-            : > source_asset.txt
-          fi
+          : > folder_assets.txt
+          TAG="${{ steps.meta.outputs.tag_name }}"
+          for DIR in source DLL standalone; do
+            if [ -d "$DIR" ]; then
+              ZIPNAME="${TAG}-${DIR}.zip"
+              (cd "$DIR" && zip -r "../$ZIPNAME" .)
+              echo "$ZIPNAME" >> folder_assets.txt
+            else
+              echo "Ordner '$DIR' nicht vorhanden, überspringe."
+            fi
+          done
 
       - name: Release-Notes zusammenbauen
         env:
@@ -94,7 +101,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mapfile -t ASSETS < assets.txt
-          mapfile -t SOURCE_ASSET < source_asset.txt
+          mapfile -t FOLDER_ASSETS < folder_assets.txt
 
           FLAGS=()
           if [ "${{ inputs.draft }}" = "true" ]; then
@@ -106,7 +113,7 @@ jobs:
 
           gh release create "${{ steps.meta.outputs.tag_name }}" \
             "${ASSETS[@]}" \
-            "${SOURCE_ASSET[@]}" \
+            "${FOLDER_ASSETS[@]}" \
             --title "${{ steps.meta.outputs.project_name }} ${{ steps.meta.outputs.timestamp }}" \
             --notes-file "release_notes.md" \
             "${FLAGS[@]}"
