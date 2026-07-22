@@ -63,17 +63,17 @@ jobs:
           cat assets.txt
 
       - name: Optionale Ordner archivieren (source, DLL, standalone)
-        id: folders
         run: |
           : > folder_assets.txt
           TAG="${{ steps.meta.outputs.tag_name }}"
-          for DIR in source DLL standalone; do
-            if [ -d "$DIR" ]; then
-              ZIPNAME="${TAG}-${DIR}.zip"
+          for NAME in source DLL standalone; do
+            DIR=$(find . -maxdepth 1 -iname "$NAME" -type d | head -n 1)
+            if [ -n "$DIR" ]; then
+              ZIPNAME="${TAG}-${NAME}.zip"
               (cd "$DIR" && zip -r "../$ZIPNAME" .)
               echo "$ZIPNAME" >> folder_assets.txt
             else
-              echo "Ordner '$DIR' nicht vorhanden, überspringe."
+              echo "Ordner '$NAME' nicht vorhanden (auch case-insensitive geprüft), überspringe."
             fi
           done
 
