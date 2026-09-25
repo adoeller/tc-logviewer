@@ -46,14 +46,14 @@ jobs:
           find . -type f \( \
               -iname "*.wdx" -o -iname "*.wcx" -o -iname "*.wfx" -o -iname "*.wlx" \
               -o -iname "*.wdx64" -o -iname "*.wcx64" -o -iname "*.wfx64" -o -iname "*.wlx64" \
-              -o -iname "*.exe" -o -iname "*32.exe" -o -iname "*64.exe" \
+              -o -iname "*.exe" \
               -o -iname "*.zip" \
               -o -iname "readme*" \
               -o -iname "license*" -o -iname "lizenz*" \
             \) ! -path "./.git/*" \
-              ! -path "./source/*" \
-              ! -path "./DLL/*" \
-              ! -path "./standalone/*" \
+              ! -ipath "./source/*" \
+              ! -ipath "./dll/*" \
+              ! -ipath "./standalone/*" \
             > assets.txt
 
           if [ ! -s assets.txt ]; then
@@ -109,6 +109,13 @@ jobs:
           fi
           if [ "${{ inputs.prerelease }}" = "true" ]; then
             FLAGS+=(--prerelease)
+          fi
+
+          DUPES=$(cat assets.txt folder_assets.txt 2>/dev/null | xargs -n1 basename | sort | uniq -d)
+          if [ -n "$DUPES" ]; then
+            echo "Mehrere Assets mit identischem Dateinamen – gh release create würde hier scheitern:" >&2
+            echo "$DUPES" >&2
+            exit 1
           fi
 
           gh release create "${{ steps.meta.outputs.tag_name }}" \
